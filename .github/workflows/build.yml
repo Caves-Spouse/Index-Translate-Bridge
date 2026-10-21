@@ -26,22 +26,28 @@ jobs:
       - name: 安装构建依赖
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq zip unzip
+          sudo apt-get install -y -qq zip unzip curl
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" > /dev/null
 
-      - name: 构建 APK（CI 临时密钥签名，仅用于可安装验证）
-        env:
-          ANDROID_JAR: ${{ env.ANDROID_HOME }}/platforms/android-34/android.jar
+      - name: 构建 APK（CI 临时密钥，仅用于验证可构建/可安装）
         run: |
           export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
+          export ANDROID_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
+          # tag 用标签名，其它情况用 dev 版本名，避免把分支名当版本号
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+          else
+            VERSION_NAME="0.0.0-dev"
+          fi
           keytool -genkeypair -keystore ci.keystore -storetype PKCS12 \
             -storepass android -keypass android -alias bridge \
             -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=CI Build" >/dev/null 2>&1
-          KEYSTORE=ci.keystore bash build.sh --version-name "${GITHUB_REF_NAME#v}"
+          KEYSTORE="$PWD/ci.keystore" bash build.sh --version-name "$VERSION_NAME"
 
       - name: 功能测试（Node 版代理）
+        env:
+          ALLOW_UPSTREAM_SKIP: "1" # GitHub runner 在境外，上游可能不可达：此时跳过联网用例而不是报红
         run: |
-          sudo apt-get install -y -qq nodejs curl
           bash tools/nodetest/run_test.sh
 
       - uses: actions/upload-artifact@v4

@@ -43,6 +43,7 @@ while [ $# -gt 0 ]; do
     --min-sdk)      MIN_SDK="$2"; shift 2 ;;
     --target-sdk)   TARGET_SDK="$2"; shift 2 ;;
     --release)      MODE="release"; shift ;;
+    --no-bump)      shift ;;   # 显式不递增 versionCode（make_release.sh 会传）
     --bump)
       VERSION_CODE=$(( $(cat "$CODE_FILE" 2>/dev/null || echo 0) + 1 ))
       echo "$VERSION_CODE" > "$CODE_FILE"
