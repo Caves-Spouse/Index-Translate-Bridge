@@ -1,0 +1,20 @@
+# 构建中间产物
+/build/
+/build_jvm/
+/dist/
+
+# 平台桩（26MB，按 README 自行下载）
+/tools/sdk/
+
+# 签名材料：绝对不要提交
+*.keystore
+*.jks
+tools/keystore.properties
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+*.log
+
+# 发布包产物（用 Release 托管，不入库）
+/release/v*/
