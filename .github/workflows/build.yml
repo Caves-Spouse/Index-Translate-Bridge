@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -29,7 +29,7 @@ jobs:
           sudo apt-get install -y -qq zip unzip curl
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" > /dev/null
 
-      - name: 构建 APK（CI 临时密钥，仅用于验证可构建/可安装）
+      - name: 构建 APK（CI 临时密钥，仅验证"可构建/可安装"）
         run: |
           export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
           export ANDROID_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
@@ -55,12 +55,10 @@ jobs:
           name: index-translate-bridge-apk
           path: dist/*.apk
 
-      - name: 创建 Release（仅打 tag 时）
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          name: Index-Translate 本地代理桥 ${{ github.ref_name }}
-          body_path: release/RELEASE_NOTES.md
-          files: |
-            dist/*.apk
-            release/使用说明.txt
+# 说明：正式 Release 的 APK 必须用**发布密钥**（tools/release.keystore）签名，
+# 而该密钥不入库、也不放在 CI Secrets 里，所以这里不自动发 Release。
+# 发布流程（在本机 Termux 执行）：
+#   bash tools/make_release.sh <版本号>
+#   git add -A && git commit -m "release v<版本号>" && git push
+#   git tag v<版本号> && git push origin v<版本号>
+#   然后在 GitHub 网页 "Draft a new release" 上传 release/v<版本号>/ 下的 3 个文件。
