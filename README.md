@@ -1,5 +1,7 @@
 # Index-Translate 本地代理桥（Android）
 
+[![build-apk](https://github.com/Caves-Spouse/Index-Translate-Bridge/actions/workflows/build.yml/badge.svg)](https://github.com/Caves-Spouse/Index-Translate-Bridge/actions/workflows/build.yml)
+
 给**沉浸式翻译 / Immersive Translate** 用的本地 OpenAI 兼容代理，把请求转发到
 bilibili 官方 **Index-Translate** 翻译模型（默认 `Index-Translate-9B`）。
 
@@ -17,8 +19,15 @@ bilibili 官方 **Index-Translate** 翻译模型（默认 `Index-Translate-9B`�
 
 ## 下载 / 安装
 
-到 [Releases](../../releases) 下载 `index-translate-bridge-x.y.z.apk`，传到手机点击安装即可。
-安装时提示「未知来源 / 未经 Play Protect 扫描」属正常现象，选「仍要安装」。
+到 [Releases](https://github.com/Caves-Spouse/Index-Translate-Bridge/releases/latest) 下载：
+
+| 文件 | 说明 |
+|---|---|
+| `index-translate-bridge-1.0.0.apk` | 安装包，32KB，Android 7.0+ |
+| `USAGE-zh.txt` | 使用说明（GitHub 不接受中文资产名，故用此名） |
+| `SHA256SUMS.txt` | 校验值，`sha256sum -c SHA256SUMS.txt` |
+
+传到手机点击安装即可；提示「未知来源 / 未经 Play Protect 扫描」属正常现象，选「仍要安装」。
 
 详细步骤（含荣耀/小米/OPPO 后台保活设置、报错对照表）见
 [`release/使用说明.txt`](release/使用说明.txt)。
@@ -92,6 +101,23 @@ node tools/make_icon.js              # 重新生成图标
 bash tools/jvmtest/run_test.sh    # 直接跑 APK 内同一份 ProxyServer.java（JVM）
 bash tools/nodetest/run_test.sh   # Node 版代理（Termux/桌面场景）
 ```
+
+GitHub Actions 在境外、可能访问不到上游，此时联网用例会被标为 `SKIP`（环境变量
+`ALLOW_UPSTREAM_SKIP=1`），不会把 CI 判红。
+
+## 发布流程（维护者）
+
+CI 只负责"能构建 + 能跑测试"，它产出的包用 CI 临时密钥签名，**不能对外发**。
+正式包必须用发布密钥在本机打，然后手动上传到 Release：
+
+```bash
+bash tools/make_release.sh 1.1.0        # 自动 +1 versionCode，产出 release/v1.1.0/
+git tag v1.1.0 && git push origin main --tags
+# 然后在 GitHub 网页 Draft a new release 上传 release/v1.1.0/ 下三个文件
+```
+
+注意：GitHub Releases 的资产名**不支持中文字符**——上传 `使用说明.txt` 会被改成
+`default.txt`，所以对外统一用 `USAGE-zh.txt` 这个名字。
 
 ## 目录结构
 
