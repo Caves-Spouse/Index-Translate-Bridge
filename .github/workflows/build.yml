@@ -21,16 +21,21 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
-      - name: 安装构建依赖
+      - name: 准备 Android SDK
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq zip unzip curl
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          set -e
+          # GitHub runner 已预装 SDK，不再用 setup-android 动作（它会找已被移除的 `tools` 包）
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          SDKM_BIN="$(dirname "$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | head -1)")"
+          echo "$SDKM_BIN" >> "$GITHUB_PATH"
+          yes | "$SDKM_BIN/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$SDKM_BIN/sdkmanager" --install "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          echo "build-tools: $(ls "$ANDROID_HOME/build-tools")"
 
       - name: 构建 APK（CI 临时密钥，仅验证"可构建/可安装"）
         run: |
+          sudo apt-get install -y -qq zip > /dev/null
           export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
           export ANDROID_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
           # tag 用标签名，其它情况用 dev 版本名，避免把分支名当版本号
