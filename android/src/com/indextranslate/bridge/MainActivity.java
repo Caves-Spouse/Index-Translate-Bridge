@@ -35,6 +35,7 @@ public class MainActivity extends Activity {
     private TextView urlView;
     private TextView logView;
     private Button toggleButton;
+    private VoiceTranslatePanel voicePanel;
 
     private final Handler handler = new Handler();
     private boolean receiverRegistered;
@@ -77,6 +78,38 @@ public class MainActivity extends Activity {
             receiverRegistered = true;
         }
         handler.post(ticker);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (voicePanel != null) {
+            voicePanel.onResume();
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (voicePanel != null) {
+            voicePanel.onPause();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (voicePanel != null) {
+            voicePanel.destroy();
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (voicePanel != null) {
+            voicePanel.onPermissionResult(requestCode, grantResults);
+        }
     }
 
     @Override
@@ -186,6 +219,10 @@ public class MainActivity extends Activity {
         steps.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         steps.setPadding(dp(12), dp(12), dp(12), dp(12));
         root.addView(steps);
+
+        // 语音翻译区：按住说话 → 系统识别 → Index-Translate 翻成中文
+        voicePanel = new VoiceTranslatePanel(this);
+        root.addView(voicePanel.getView());
 
         TextView logTitle = new TextView(this);
         logTitle.setText("运行日志");

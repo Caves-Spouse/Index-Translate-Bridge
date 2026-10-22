@@ -18,3 +18,4 @@ Thumbs.db
 
 # 发布包产物（用 Release 托管，不入库）
 /release/v*/
+.pi/
