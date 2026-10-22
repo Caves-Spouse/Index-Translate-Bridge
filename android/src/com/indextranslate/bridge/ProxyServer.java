@@ -19,6 +19,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * 极简 OpenAI 兼容代理（零第三方依赖）。
@@ -37,6 +39,36 @@ public final class ProxyServer {
     private static final int MAX_JSON_RESPONSE = 16 * 1024 * 1024;
     private static final int CONNECT_TIMEOUT_MS = 15000;
     private static final int READ_TIMEOUT_MS = 180000;
+    /** 小于 512B 的请求体压完往往更大，直接发明文。 */
+    private static final int GZIP_MIN_BYTES = 512;
+    /** 回退前最多读掉这么多上游字节，再多就放弃复用这条连接。 */
+    private static final int MAX_DRAIN_BYTES = 256 * 1024;
+
+    /**
+     * 传输层压缩总开关。APK 内恒为开启；JVM 下调试可用
+     * {@code -Dindex.bridge.gzip=0} 关掉，便于对比压缩前后的字节数。
+     */
+    private static final boolean COMPRESSION_ENABLED =
+            !"0".equals(System.getProperty("index.bridge.gzip", "1"));
+    /**
+     * 请求体压缩单独开关：上游（index-translate.bilibili.com）目前对
+     * {@code Content-Encoding: gzip} 的请求体直接返 400，会自动回退，
+     * 但首次回退仍要付一次往返。若只想保留响应压缩，可用
+     * {@code -Dindex.bridge.gzip.upload=0}。
+     */
+    private static final boolean UPLOAD_GZIP_ENABLED = COMPRESSION_ENABLED
+            && !"0".equals(System.getProperty("index.bridge.gzip.upload", "1"));
+
+    static {
+        // HttpURLConnection 默认会复用 keep-alive 连接，但连接池上限只有 5，
+        // 并发翻译时容易退化成每条请求重新做一次 TCP+TLS 握手。
+        if (System.getProperty("http.keepAlive") == null) {
+            System.setProperty("http.keepAlive", "true");
+        }
+        if (System.getProperty("http.maxConnections") == null) {
+            System.setProperty("http.maxConnections", "16");
+        }
+    }
 
     private static final String CORS_HEADERS =
             "Access-Control-Allow-Origin: *\r\n"
@@ -48,6 +80,9 @@ public final class ProxyServer {
     private final String upstreamBase;
     private final String defaultModel;
     private final int startPort;
+
+    /** 上游一旦拒绝过 gzip 请求体，本进程后续就直接发明文，避免每次多花一次往返。 */
+    private volatile boolean upstreamGzipRejected;
 
     private volatile ServerSocket serverSocket;
     private volatile boolean running;
@@ -201,8 +236,10 @@ public final class ProxyServer {
                         errorJson("unknown path: " + path + " (try /v1/chat/completions)"));
                 return;
             }
-            forward(out, path, body);
-            ProxyState.log(tag + " ok " + (System.currentTimeMillis() - started) + "ms");
+            Stats stats = forward(out, path, body, headers);
+            ProxyState.log(tag + " ok " + (System.currentTimeMillis() - started) + "ms"
+                    + " ↑" + stats.up.data.length + "B" + (stats.up.gzip ? "(gzip)" : "")
+                    + " ↓" + stats.downBytes + "B" + (stats.downGzip ? "(gzip)" : ""));
         } catch (IOException e) {
             ProxyState.log(tag + " 连接异常: " + e.getMessage());
         } catch (RuntimeException e) {
@@ -212,61 +249,88 @@ public final class ProxyServer {
         }
     }
 
-    /** 转发到上游；SSE 边收边发，普通 JSON 缓冲后带 Content-Length 回写。 */
-    private void forward(OutputStream out, String path, byte[] body) throws IOException {
+    /**
+     * 转发到上游；SSE 边收边发，普通 JSON 缓冲后带 Content-Length 回写。
+     *
+     * 传输层策略：
+     *   1. 请求体超过阈值先 gzip 再上传（译文请求是 JSON 文本，压缩率通常 60%~80%）；
+     *      上游若不接受，回退一次明文重发，并记住“本进程不再压缩上传”；
+     *   2. 客户端声明支持 gzip 时，让上游压缩响应并把压缩字节原样透传（浏览器自行解压）；
+     *   3. SSE 两端都保持 identity，逐块 flush，牺牲压缩换实时性；
+     *   4. 读完 body 只 close()，不 disconnect()，让连接回到 keep-alive 池复用 TLS 会话。
+     */
+    private Stats forward(OutputStream out, String path, byte[] body, Map<String, String> clientHeaders)
+            throws IOException {
         byte[] payload = preparePayload(body);
-        HttpURLConnection conn = null;
+        boolean streamRequest = isStreamRequest(payload);
+        // curl 等不声明 Accept-Encoding 的客户端不给压缩响应，避免把二进制塞给不认识它的调用方
+        boolean clientGzip = COMPRESSION_ENABLED && acceptsGzip(clientHeaders.get("accept-encoding"));
+        boolean wantGzipResponse = clientGzip && !streamRequest;
+
+        Upload upload = buildUpload(payload, UPLOAD_GZIP_ENABLED && !upstreamGzipRejected);
+        Upstream up = null;
         boolean headSent = false;
+        long downBytes = 0;
+        boolean downGzip = false;
         try {
-            URL url = new URL(upstreamBase + path);
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(READ_TIMEOUT_MS);
-            conn.setUseCaches(false);
-            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-            // 上游对 UA 敏感，固定的客户端 UA 可避免反爬 412
-            conn.setRequestProperty("User-Agent", "Index-Translate-Client/1.0");
-            conn.setRequestProperty("Accept", "text/event-stream, application/json");
-            conn.setRequestProperty("Accept-Encoding", "identity");
-            conn.setFixedLengthStreamingMode(payload.length);
+            up = openUpstream(path, upload, wantGzipResponse);
+            if (upload.gzip && shouldRetryAsPlain(up.code)) {
+                int rejected = up.code;
+                up.close();
+                up = null;
+                upstreamGzipRejected = true;
+                ProxyState.log("上游拒绝 gzip 请求体(" + rejected + ")，本进程后续改为明文上传");
+                upload = buildUpload(payload, false);
+                up = openUpstream(path, upload, wantGzipResponse);
+            }
 
-            OutputStream upstreamOut = conn.getOutputStream();
-            upstreamOut.write(payload);
-            upstreamOut.flush();
-            upstreamOut.close();
-
-            int code = conn.getResponseCode();
-            String contentType = conn.getContentType();
+            int code = up.code;
+            String contentType = up.contentType;
             boolean sse = contentType != null
                     && contentType.toLowerCase(Locale.US).contains("text/event-stream");
-            InputStream resp = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            if (resp == null) {
-                resp = conn.getErrorStream();
-            }
+            InputStream resp = up.stream;
 
             if (resp == null) {
                 writeSimple(out, 502, "application/json; charset=utf-8",
                         errorJson("upstream returned " + code + " with no body"));
-                return;
+                return new Stats(upload, 0, false);
             }
 
             if (sse) {
-                writeHead(out, code, contentType, -1);
+                // 万一上游无视 identity 仍然压缩：gzip 先解开再直通，保证客户端收到可解析的 SSE；
+                // 其它编码（罕见，如 br）只能原样透传并声明 Content-Encoding，交给客户端解。
+                String sseEncoding = up.contentEncoding;
+                InputStream sseIn = resp;
+                String sseExtra = null;
+                if (up.isGzipEncoded()) {
+                    sseIn = new GZIPInputStream(resp);
+                } else if (sseEncoding != null && !"identity".equalsIgnoreCase(sseEncoding.trim())) {
+                    sseExtra = "Content-Encoding: " + sseEncoding.trim() + "\r\n";
+                }
+                writeHead(out, code, contentType, -1, sseExtra);
                 headSent = true;
-                copyStream(resp, out, true, Long.MAX_VALUE);
+                downBytes = copyStream(sseIn, out, true, Long.MAX_VALUE);
             } else {
                 ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-                copyStream(resp, buffer, true, MAX_JSON_RESPONSE);
+                copyStream(resp, buffer, false, MAX_JSON_RESPONSE);
                 byte[] data = buffer.toByteArray();
-                writeHead(out, code, contentType == null ? "application/json; charset=utf-8" : contentType,
-                        data.length);
+                // 上游已压缩：字节原样透传 + 声明 Content-Encoding，客户端自行解压。
+                // 用 gzip 魔数兜底，防止上游声称 gzip 却发了明文。
+                boolean passthrough = wantGzipResponse && isEncodedBody(up.contentEncoding, data);
+                String extra = passthrough
+                        ? "Content-Encoding: " + up.contentEncoding.trim()
+                                + "\r\nVary: Accept-Encoding\r\n"
+                        : null;
+                writeHead(out, code,
+                        contentType == null ? "application/json; charset=utf-8" : contentType,
+                        data.length, extra);
                 headSent = true;
                 out.write(data);
                 out.flush();
+                downBytes = data.length;
+                downGzip = passthrough;
             }
-            resp.close();
+            return new Stats(upload, downBytes, downGzip);
         } catch (IOException e) {
             ProxyState.log("上游请求失败: " + e.getMessage());
             // 已经发过头就不能再发状态行，否则会把响应写坏
@@ -278,10 +342,56 @@ public final class ProxyServer {
                     // 客户端已断开
                 }
             }
+            return new Stats(upload, downBytes, downGzip);
         } finally {
-            if (conn != null) {
-                conn.disconnect();
+            if (up != null) {
+                up.close();
             }
+        }
+    }
+
+    /** 发起一次上游 POST；读完 body 后由调用方 close() 归还连接。 */
+    private Upstream openUpstream(String path, Upload upload, boolean gzipResponse) throws IOException {
+        URL url = new URL(upstreamBase + path);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        try {
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(READ_TIMEOUT_MS);
+            conn.setUseCaches(false);
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            // 上游对 UA 敏感，固定的客户端 UA 可避免反爬 412
+            conn.setRequestProperty("User-Agent", "Index-Translate-Client/1.0");
+            conn.setRequestProperty("Accept", "text/event-stream, application/json");
+            conn.setRequestProperty("Accept-Encoding", gzipResponse ? "gzip" : "identity");
+            if (upload.gzip) {
+                conn.setRequestProperty("Content-Encoding", "gzip");
+            }
+            conn.setFixedLengthStreamingMode(upload.data.length);
+
+            OutputStream upstreamOut = conn.getOutputStream();
+            try {
+                upstreamOut.write(upload.data);
+                upstreamOut.flush();
+            } finally {
+                upstreamOut.close();
+            }
+
+            int code = conn.getResponseCode();
+            InputStream resp = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            if (resp == null) {
+                resp = conn.getErrorStream();
+            }
+            return new Upstream(code, conn.getContentType(),
+                    conn.getHeaderField("Content-Encoding"), resp, conn);
+        } catch (IOException e) {
+            // 请求或读响应头失败：这条连接已不可复用，必须直接关掉
+            conn.disconnect();
+            throw e;
+        } catch (RuntimeException e) {
+            conn.disconnect();
+            throw e;
         }
     }
 
@@ -462,6 +572,12 @@ public final class ProxyServer {
 
     private void writeHead(OutputStream out, int code, String contentType, long contentLength)
             throws IOException {
+        writeHead(out, code, contentType, contentLength, null);
+    }
+
+    /** @param extraHeaders 形如 "Header: v\r\n" 的额外响应头，可为 null */
+    private void writeHead(OutputStream out, int code, String contentType, long contentLength,
+                           String extraHeaders) throws IOException {
         StringBuilder sb = new StringBuilder(256);
         sb.append("HTTP/1.1 ").append(code).append(' ').append(reason(code)).append("\r\n");
         if (contentType != null) {
@@ -469,6 +585,9 @@ public final class ProxyServer {
         }
         sb.append(CORS_HEADERS);
         sb.append("Cache-Control: no-store\r\n");
+        if (extraHeaders != null) {
+            sb.append(extraHeaders);
+        }
         if (contentLength >= 0) {
             sb.append("Content-Length: ").append(contentLength).append("\r\n");
         } else {
@@ -489,7 +608,7 @@ public final class ProxyServer {
         out.flush();
     }
 
-    private void copyStream(InputStream in, OutputStream out, boolean flushEachChunk, long max)
+    private long copyStream(InputStream in, OutputStream out, boolean flushEachChunk, long max)
             throws IOException {
         byte[] buf = new byte[8192];
         long total = 0;
@@ -505,6 +624,112 @@ public final class ProxyServer {
             }
         }
         out.flush();
+        return total;
+    }
+
+    // ------------------------------------------------------------ 传输层工具
+
+    /** 客户端是否接受 gzip；识别 gzip;q=0 这种显式拒绝。 */
+    private static boolean acceptsGzip(String header) {
+        if (header == null) {
+            return false;
+        }
+        String h = header.toLowerCase(Locale.US);
+        return h.contains("gzip") && !h.contains("gzip;q=0") && !h.contains("gzip; q=0");
+    }
+
+    /** 请求体是否要求 SSE 流式返回（"stream": true）。 */
+    private static boolean isStreamRequest(byte[] payload) {
+        if (payload == null || payload.length == 0) {
+            return false;
+        }
+        String s = new String(payload, utf8());
+        int i = s.indexOf("\"stream\"");
+        if (i < 0) {
+            return false;
+        }
+        int colon = s.indexOf(':', i + 8);
+        if (colon < 0) {
+            return false;
+        }
+        return s.substring(colon + 1).trim().startsWith("true");
+    }
+
+    private static boolean isGzipData(byte[] data) {
+        return data.length > 2 && (data[0] & 0xff) == 0x1f && (data[1] & 0xff) == 0x8b;
+    }
+
+    /**
+     * body 是否真的是压缩过的（可以原样透传 + 声明 Content-Encoding）。
+     * gzip 用魔数验证；其它编码无法验证，按声明透传。
+     */
+    private static boolean isEncodedBody(String contentEncoding, byte[] data) {
+        if (contentEncoding == null) {
+            return false;
+        }
+        String enc = contentEncoding.trim();
+        if (enc.length() == 0 || "identity".equalsIgnoreCase(enc)) {
+            return false;
+        }
+        if (enc.toLowerCase(Locale.US).contains("gzip")) {
+            return isGzipData(data);
+        }
+        return true;
+    }
+
+    /**
+     * 上游拒绝 gzip 请求体时的回退判定。401/403/404/408/429/504 与压缩无关
+     * （鉴权 / 限流 / 超时），回退只会白多一次往返。
+     */
+    private static boolean shouldRetryAsPlain(int code) {
+        if (code < 400) {
+            return false;
+        }
+        switch (code) {
+            case 401:
+            case 403:
+            case 404:
+            case 408:
+            case 429:
+            case 504:
+                return false;
+            default:
+                return true;
+        }
+    }
+
+    /** 压缩请求体；压完不变小就保持明文。 */
+    private static Upload buildUpload(byte[] payload, boolean allowGzip) {
+        if (!allowGzip || payload.length < GZIP_MIN_BYTES) {
+            return new Upload(payload, false);
+        }
+        byte[] zipped = gzipBytes(payload);
+        if (zipped == null || zipped.length >= payload.length) {
+            return new Upload(payload, false);
+        }
+        return new Upload(zipped, true);
+    }
+
+    private static byte[] gzipBytes(byte[] data) {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.max(64, data.length / 3));
+        GZIPOutputStream gz = null;
+        try {
+            gz = new GZIPOutputStream(bos, 8192);
+            gz.write(data);
+            gz.finish();
+            gz.flush();
+            return bos.toByteArray();
+        } catch (IOException e) {
+            return null;
+        } finally {
+            if (gz != null) {
+                try {
+                    gz.close();
+                } catch (IOException ignored) {
+                    // 忽略
+                }
+            }
+        }
     }
 
     private static String reason(int code) {
@@ -591,6 +816,84 @@ public final class ProxyServer {
             } catch (IOException ignored) {
                 // 忽略
             }
+        }
+    }
+
+    // ------------------------------------------------------------ 内部数据结构
+
+    /** 待上传的请求体（可能是 gzip 后的字节）。 */
+    private static final class Upload {
+        final byte[] data;
+        final boolean gzip;
+
+        Upload(byte[] data, boolean gzip) {
+            this.data = data;
+            this.gzip = gzip;
+        }
+    }
+
+    /** 一次上游响应；读完 body 后 close()，连接会回到 keep-alive 池。 */
+    private static final class Upstream {
+        final int code;
+        final String contentType;
+        final String contentEncoding;
+        final InputStream stream;
+        final HttpURLConnection conn;
+
+        Upstream(int code, String contentType, String contentEncoding, InputStream stream,
+                 HttpURLConnection conn) {
+            this.code = code;
+            this.contentType = contentType;
+            this.contentEncoding = contentEncoding;
+            this.stream = stream;
+            this.conn = conn;
+        }
+
+        boolean isGzipEncoded() {
+            return contentEncoding != null && contentEncoding.toLowerCase(Locale.US).contains("gzip");
+        }
+
+        void close() {
+            if (stream == null) {
+                if (conn != null) {
+                    // 没有 body 可读，这条连接无法安全复用
+                    conn.disconnect();
+                }
+                return;
+            }
+            try {
+                // 把剩余字节读净，连接才能安全回池；超过上限就弃用这条连接
+                byte[] skip = new byte[4096];
+                long drained = 0;
+                int n;
+                while ((n = stream.read(skip)) != -1) {
+                    drained += n;
+                    if (drained > MAX_DRAIN_BYTES) {
+                        conn.disconnect();
+                        break;
+                    }
+                }
+            } catch (IOException ignored) {
+                // 已断开
+            }
+            try {
+                stream.close();
+            } catch (IOException ignored) {
+                // 忽略
+            }
+        }
+    }
+
+    /** 单次转发的字节统计，用于日志里直观看到压缩收益。 */
+    private static final class Stats {
+        final Upload up;
+        final long downBytes;
+        final boolean downGzip;
+
+        Stats(Upload up, long downBytes, boolean downGzip) {
+            this.up = up;
+            this.downBytes = downBytes;
+            this.downGzip = downGzip;
         }
     }
 }

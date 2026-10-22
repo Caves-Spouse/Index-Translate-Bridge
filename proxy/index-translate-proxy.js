@@ -14,6 +14,8 @@
  *   - 端口自动探测：默认从 8080 起，被占用则自动 +1 直到成功
  *   - 仅绑定 127.0.0.1（绝不对外暴露）
  *   - SSE 流式透传（边收边发，不缓冲）
+ *   - 非流式请求体/响应体 gzip（请求体被上游拒绝时自动回退一次明文）
+ *   - 上游连接 keep-alive 复用，避免每条请求重做 TCP+TLS 握手
  *   - 完整 CORS 支持（OPTIONS 预检 / 所有响应带 ACAO）
  *
  * 环境变量：
@@ -21,6 +23,8 @@
  *   PORT_TRIES      最多尝试多少个端口（默认 30）
  *   DEFAULT_MODEL   客户端未指定 model 时使用（默认 Index-Translate-9B）
  *   UPSTREAM_BASE   上游 base（默认 https://index-translate.bilibili.com/v1）
+ *   DISABLE_GZIP=1  关闭传输层压缩（调试/对比流量用）
+ *   DISABLE_GZIP_UPLOAD=1  只关请求体压缩，保留响应压缩（上游拒收 gzip 请求体时省一次回退）
  *   QUIET=1         关闭逐请求日志
  */
 
@@ -28,6 +32,7 @@
 
 const http = require('http');
 const https = require('https');
+const zlib = require('zlib');
 
 const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://index-translate.bilibili.com/v1').replace(/\/+$/, '');
 const BIND_HOST = '127.0.0.1';
@@ -39,18 +44,37 @@ const QUIET = process.env.QUIET === '1';
 const KNOWN_MODELS = ['Index-Translate-9B', 'Index-Translate-2B', 'Index-Translate-35B-A3B'];
 const MAX_BODY = 32 * 1024 * 1024; // 32MB，够多模态图片 Base64
 const UPSTREAM_TIMEOUT = 180000; // 180s
+const GZIP_MIN_BYTES = 512; // 小于 512B 压完往往更大，直接发明文
+const DISABLE_GZIP = process.env.DISABLE_GZIP === '1';
+const DISABLE_GZIP_UPLOAD = DISABLE_GZIP || process.env.DISABLE_GZIP_UPLOAD === '1';
 
 // ---------------------------------------------------------------- 上游转发
 
-const upstreamAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
+const AGENT_OPTIONS = {
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  scheduling: 'lifo',
+};
+const httpsAgent = new https.Agent(AGENT_OPTIONS);
+const httpAgent = new http.Agent(AGENT_OPTIONS);
 
 const upstream = new URL(UPSTREAM_BASE);
+// UPSTREAM_BASE 可指向 http 上游（自建/中转），此时不能强行走 https
+const transport = upstream.protocol === 'http:' ? http : https;
+const upstreamAgent = upstream.protocol === 'http:' ? httpAgent : httpsAgent;
 
-function forwardUpstream(upstreamPath, bodyBuffer) {
+/** 上游一旦拒绝过 gzip 请求体，本进程后续直接发明文，避免每次多花一次往返 */
+let upstreamGzipRejected = false;
+
+function forwardUpstream(upstreamPath, bodyBuffer, opts) {
+  const gzipBody = !!(opts && opts.gzipBody);
+  const gzipResponse = !!(opts && opts.gzipResponse);
   const options = {
     protocol: upstream.protocol,
     hostname: upstream.hostname,
-    port: upstream.port || 443,
+    port: upstream.port || (upstream.protocol === 'http:' ? 80 : 443),
     method: 'POST',
     path: `${upstream.pathname.replace(/\/+$/, '')}${upstreamPath}`,
     agent: upstreamAgent,
@@ -60,17 +84,58 @@ function forwardUpstream(upstreamPath, bodyBuffer) {
       // 上游对 UA 敏感，用固定客户端 UA 避免反爬 412
       'User-Agent': 'Index-Translate-Client/1.0',
       Accept: 'text/event-stream, application/json',
-      'Accept-Encoding': 'identity',
+      // 只有调用方明确要求时才让上游压缩（SSE 必须 identity）
+      'Accept-Encoding': gzipResponse ? 'gzip' : 'identity',
+      Connection: 'keep-alive',
     },
   };
+  if (gzipBody) options.headers['Content-Encoding'] = 'gzip';
   return new Promise((resolve, reject) => {
-    const req = https.request(options, resolve);
+    const req = transport.request(options, resolve);
     req.setTimeout(UPSTREAM_TIMEOUT, () => {
       req.destroy(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT}ms`));
     });
     req.on('error', reject);
     req.end(bodyBuffer);
   });
+}
+
+// ---------------------------------------------------------------- 传输层工具
+
+/** 客户端是否接受 gzip；识别 gzip;q=0 这种显式拒绝 */
+function acceptsGzip(header) {
+  if (!header) return false;
+  const h = String(header).toLowerCase();
+  return h.includes('gzip') && !h.includes('gzip;q=0') && !h.includes('gzip; q=0');
+}
+
+/** 压完不变小就返回 null（保持明文） */
+function gzipBuffer(buf) {
+  try {
+    const gz = zlib.gzipSync(buf);
+    return gz.length < buf.length ? gz : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** 上游拒绝 gzip 请求体时的回退判定（与 Java 版保持一致） */
+function shouldRetryAsPlain(status) {
+  if (status < 400) return false;
+  return ![401, 403, 404, 408, 429, 504].includes(status);
+}
+
+function contentEncodingOf(headers) {
+  const ce = headers && headers['content-encoding'];
+  return typeof ce === 'string' ? ce.trim() : '';
+}
+
+function isGzipEncoding(ce) {
+  return !!ce && ce.toLowerCase().includes('gzip');
+}
+
+function looksGzip(buf) {
+  return buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b;
 }
 
 // ---------------------------------------------------------------- 工具函数
@@ -209,9 +274,31 @@ const server = http.createServer(async (req, res) => {
   const isStream = payload.stream === true;
   const bodyBuffer = Buffer.from(JSON.stringify(payload), 'utf8');
 
+  // 压缩策略与 Java 版对齐：
+  //   - 客户端声明支持 gzip 且非流式 → 让上游压缩并原样透传压缩字节；
+  //   - 请求体超阈值先 gzip 上传，上游拒绝则只回退一次明文并记住结果；
+  //   - SSE 恒用 identity，保逐块到达。
+  const clientGzip = !DISABLE_GZIP && acceptsGzip(req.headers['accept-encoding']);
+  const gzipResponse = clientGzip && !isStream;
+  let bodyGzip = null;
+  if (!DISABLE_GZIP_UPLOAD && !upstreamGzipRejected && bodyBuffer.length >= GZIP_MIN_BYTES) {
+    bodyGzip = gzipBuffer(bodyBuffer);
+  }
+  let upload = bodyGzip || bodyBuffer;
+  let uploadGzip = !!bodyGzip;
+
   let upstreamRes;
   try {
-    upstreamRes = await forwardUpstream(path, bodyBuffer);
+    upstreamRes = await forwardUpstream(path, upload, { gzipBody: uploadGzip, gzipResponse });
+    if (uploadGzip && shouldRetryAsPlain(upstreamRes.statusCode || 502)) {
+      const rejected = upstreamRes.statusCode || 502;
+      upstreamRes.resume(); // 丢掉被拒绝的响应体，让连接回池
+      upstreamGzipRejected = true;
+      log(`上游拒绝 gzip 请求体(${rejected})，本进程后续改为明文上传`);
+      upload = bodyBuffer;
+      uploadGzip = false;
+      upstreamRes = await forwardUpstream(path, upload, { gzipBody: false, gzipResponse });
+    }
   } catch (e) {
     log(`${req.method} ${path} -> 502 (${e.message})`);
     sendJson(res, 502, { error: { message: `upstream unreachable: ${e.message}`, type: 'upstream_error' } });
@@ -226,7 +313,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (isStream && status === 200) {
-    // SSE：不设 content-length，边收边发
+    // SSE：不设 content-length，边收边发；上游若无视 identity 仍压缩，先解开再直通
+    const sseEncoding = contentEncodingOf(upstreamRes.headers);
+    let source = upstreamRes;
+    if (isGzipEncoding(sseEncoding)) {
+      source = upstreamRes.pipe(zlib.createGunzip());
+    } else if (sseEncoding && sseEncoding.toLowerCase() !== 'identity') {
+      headers['Content-Encoding'] = sseEncoding;
+    }
     headers['Content-Type'] = headers['Content-Type'] || 'text/event-stream; charset=utf-8';
     headers['Cache-Control'] = 'no-cache, no-transform';
     headers['X-Accel-Buffering'] = 'no';
@@ -236,19 +330,20 @@ const server = http.createServer(async (req, res) => {
 
     let firstChunkAt = null;
     let bytes = 0;
-    upstreamRes.on('data', (chunk) => {
+    source.on('data', (chunk) => {
       if (firstChunkAt === null) firstChunkAt = Date.now();
       bytes += chunk.length;
       res.write(chunk);
     });
-    upstreamRes.on('end', () => {
+    source.on('end', () => {
       res.end();
       log(
-        `POST ${path} model=${payload.model} stream -> ${status} ${bytes}B ` +
+        `POST ${path} model=${payload.model} stream -> ${status} ` +
+          `↑${upload.length}B${uploadGzip ? '(gzip)' : ''} ↓${bytes}B ` +
           `ttfb=${firstChunkAt ? firstChunkAt - started : '-'}ms total=${Date.now() - started}ms`
       );
     });
-    upstreamRes.on('error', (e) => {
+    source.on('error', (e) => {
       log(`POST ${path} stream aborted: ${e.message}`);
       res.destroy();
     });
@@ -263,12 +358,27 @@ const server = http.createServer(async (req, res) => {
   upstreamRes.on('data', (c) => chunks.push(c));
   upstreamRes.on('end', () => {
     const buf = Buffer.concat(chunks);
+    // 上游已压缩：字节原样透传 + 声明 Content-Encoding，客户端自行解压
+    const ce = contentEncodingOf(upstreamRes.headers);
+    let passthrough = false;
+    if (gzipResponse && ce && ce.toLowerCase() !== 'identity') {
+      if (isGzipEncoding(ce)) {
+        if (looksGzip(buf)) {
+          headers['Content-Encoding'] = 'gzip';
+          passthrough = true;
+        }
+      } else {
+        headers['Content-Encoding'] = ce;
+        passthrough = true;
+      }
+    }
+    if (passthrough) headers['Vary'] = 'Accept-Encoding';
     headers['Content-Length'] = buf.length;
     if (!headers['Content-Type']) headers['Content-Type'] = 'application/json; charset=utf-8';
     res.writeHead(status, headers);
     res.end(buf);
     let extra = '';
-    if (status === 200 && payload.model) {
+    if (status === 200 && payload.model && !passthrough) {
       try {
         const j = JSON.parse(buf.toString('utf8'));
         const u = j.usage;
@@ -277,7 +387,11 @@ const server = http.createServer(async (req, res) => {
         /* 忽略解析失败 */
       }
     }
-    log(`POST ${path} model=${payload.model} -> ${status} ${buf.length}B${extra} total=${Date.now() - started}ms`);
+    log(
+      `POST ${path} model=${payload.model} -> ${status} ` +
+        `↑${upload.length}B${uploadGzip ? '(gzip)' : ''} ↓${buf.length}B${passthrough ? '(gzip)' : ''}` +
+        `${extra} total=${Date.now() - started}ms`
+    );
   });
   upstreamRes.on('error', (e) => {
     log(`POST ${path} read error: ${e.message}`);
