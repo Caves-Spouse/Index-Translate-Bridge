@@ -7,7 +7,7 @@ bilibili 官方 **Index-Translate** 翻译模型（默认 `Index-Translate-9B`�
 
 解决两件事：**扩展直连上游被 CORS / 反爬拦掉（412）**、**思考文本污染译文**。
 
-- 32KB 单 APK，**零第三方依赖**（纯 Java + JDK 标准库），不需要 Termux / root / 账号
+- 29KB 单 APK，**零第三方依赖**（纯 Java + JDK 标准库），不需要 Termux / root / 账号
 - 一键启动：点图标即启动前台服务，通知栏显示端口
 - **端口自动探测**：8080 被占用自动 +1 重试，界面显示实际端口
 - **只监听 `127.0.0.1`**，不对外暴露；上游无需 API Key
@@ -23,7 +23,7 @@ bilibili 官方 **Index-Translate** 翻译模型（默认 `Index-Translate-9B`�
 
 | 文件 | 说明 |
 |---|---|
-| `index-translate-bridge-1.0.0.apk` | 安装包，32KB，Android 7.0+ |
+| `index-translate-bridge-1.0.1.apk` | 安装包，29KB，Android 7.0+ |
 | `USAGE-zh.txt` | 使用说明（GitHub 不接受中文资产名，故用此名） |
 | `SHA256SUMS.txt` | 校验值，`sha256sum -c SHA256SUMS.txt` |
 

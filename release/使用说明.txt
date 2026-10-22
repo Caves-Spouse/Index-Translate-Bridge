@@ -4,7 +4,7 @@ Index-Translate 本地代理桥 · 使用说明
 这是一个"翻译代理"小工具。它把沉浸式翻译的请求，转发到 bilibili 官方的
 Index-Translate 翻译模型（默认 9B），解决浏览器扩展直连会报错的问题。
 
-体积 32KB，不需要 Termux、不需要 root、不需要任何账号。
+体积 29KB，不需要 Termux、不需要 root、不需要任何账号。
 
 
 一、安装
