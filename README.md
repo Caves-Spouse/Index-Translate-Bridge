@@ -5,7 +5,7 @@
 给**沉浸式翻译 / Immersive Translate** 用的本地 OpenAI 兼容代理，把请求转发到
 bilibili 官方 **Index-Translate** 翻译模型（默认 `Index-Translate-9B`）。
 
-解决两件事：**扩展直连上游被 CORS / 反爬拦掉（412）**、**思考文本污染译文**。
+目的：**扩展直连上游被 CORS / 反爬拦掉（412）**、**思考文本污染译文**。
 
 - 29KB 单 APK，**零第三方依赖**（纯 Java + JDK 标准库），不需要 Termux / root / 账号
 - 一键启动：点图标即启动前台服务，通知栏显示端口
@@ -28,6 +28,7 @@ bilibili 官方 **Index-Translate** 翻译模型（默认 `Index-Translate-9B`�
 | `SHA256SUMS.txt` | 校验值，`sha256sum -c SHA256SUMS.txt` |
 
 传到手机点击安装即可；提示「未知来源 / 未经 Play Protect 扫描」属正常现象，选「仍要安装」。
+记得去设置-耗电详细-允许后台运行。否则可能造成翻译服务中断。
 
 详细步骤（含荣耀/小米/OPPO 后台保活设置、报错对照表）见
 [`release/使用说明.txt`](release/使用说明.txt)。
